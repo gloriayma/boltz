@@ -826,6 +826,81 @@ def parse_connection(
     return conn
 
 
+def compute_water_fractional_credit(
+    water_coords: list[tuple[float, float, float]],
+    residue_coords: np.ndarray,
+    max_distance: float = 10.0,
+    temperature: float = 1.0,
+) -> np.ndarray:
+    """Compute per-residue water fractional credit.
+
+    For each water molecule, if it has any residues within max_distance, distribute
+    1 unit of mass to nearby residues based on a softmax of distance. If no residues
+    are within max_distance, the water contributes 0.
+
+    Parameters
+    ----------
+    water_coords : list[tuple[float, float, float]]
+        List of water oxygen coordinates (x, y, z).
+    residue_coords : np.ndarray
+        Array of shape (num_residues, 3) containing residue center coordinates.
+    max_distance : float, optional
+        Maximum distance to consider (Å), by default 10.0.
+    temperature : float, optional
+        Softmax temperature, by default 1.0. Must be > 0.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape (num_residues,) with per-residue water fractional credit.
+    """
+    if len(water_coords) == 0:
+        return np.zeros(len(residue_coords), dtype=np.float32)
+
+    # Guard against temperature = 0
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+
+    water_coords_array = np.array(water_coords, dtype=np.float32)  # (num_waters, 3)
+    residue_coords_array = np.array(residue_coords, dtype=np.float32)  # (num_residues, 3)
+
+    # Compute distances: (num_waters, num_residues)
+    # water_coords_array[:, None, :] -> (num_waters, 1, 3)
+    # residue_coords_array[None, :, :] -> (1, num_residues, 3)
+    distances = np.linalg.norm(
+        water_coords_array[:, None, :] - residue_coords_array[None, :, :],
+        axis=2,
+    )  # (num_waters, num_residues)
+
+    within_radius = distances <= max_distance  # (num_waters, num_residues)
+
+    # Compute softmax weights: exp(-distance / temperature)
+
+    logits = np.where(within_radius, -distances / temperature, -np.inf)  # (num_waters, num_residues)
+
+
+    max_logits = np.max(logits, axis=1, keepdims=True)  # (num_waters, 1)
+
+    logits_stable = logits - max_logits  # (num_waters, num_residues)
+
+    exp_logits = np.where(np.isfinite(logits_stable), np.exp(logits_stable), 0.0)  # (num_waters, num_residues)
+
+    exp_sums = np.sum(exp_logits, axis=1, keepdims=True)  # (num_waters, 1)
+
+    # Normalize: divide by sum (only for waters with nearby residues)
+    weights = np.divide(
+        exp_logits,
+        exp_sums,
+        out=np.zeros_like(exp_logits),
+        where=(exp_sums > 0),
+    )  # (num_waters, num_residues)
+
+    # Sum contributions from all waters: each water contributes 1.0 total (if within radius)
+    water_counts = np.sum(weights, axis=0)  # (num_residues,)
+
+    return water_counts.astype(np.float32)
+
+
 def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     path: str,
     components: dict[str, Mol],
@@ -864,7 +939,6 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
 
     # Clean up the structure
     structure.merge_chain_parts()
-    structure.remove_waters()
     structure.remove_hydrogens()
     structure.remove_alternative_conformations()
     structure.remove_empty_chains()
@@ -874,6 +948,38 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
         how = gemmi.HowToNameCopiedChain.AddNumber
         assembly_name = structure.assemblies[0].name
         structure.transform_to_assembly(assembly_name, how=how)
+
+    # Extract water coordinates AFTER assembly expansion but BEFORE removal
+    # Use gemmi's entity type to identify waters (more robust than checking residue name)
+    water_coords: list[tuple[float, float, float]] = []
+    
+    # Create a set of water entity subchains for fast lookup
+    water_subchains = set()
+    for entity in structure.entities:
+        if entity.entity_type.name == "Water":
+            water_subchains.update(entity.subchains)
+    
+    # Iterate through structure to find water residues
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                # Check if this residue belongs to a water entity
+                # Also check residue name as fallback (HOH is standard PDB convention)
+                is_water = (
+                    residue.subchain in water_subchains
+                    or residue.name == "HOH"
+                    or residue.name == "WAT"  # Alternative water naming
+                )
+                
+                if is_water:
+                    # Extract oxygen atom coordinates (water oxygen is typically named "O")
+                    for atom in residue:
+                        if atom.name == "O":  # Water oxygen atom
+                            water_coords.append((atom.pos.x, atom.pos.y, atom.pos.z))
+                            break  # Only need one oxygen per water molecule
+
+    # Remove waters now (after extraction)
+    structure.remove_waters()
 
     # Parse entities
     # Create mapping from subchain id to entity
@@ -1091,6 +1197,35 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     # Convert into datatypes
     atoms = np.array(atom_data, dtype=Atom)
     bonds = np.array(bond_data, dtype=Bond)
+    
+    # Extract residue center coordinates from atoms array
+    residue_coords = []
+    for res_tuple in res_data:
+        atom_center_idx = res_tuple[6]  # atom_center is 7th field (0-indexed: 6)
+        if atom_center_idx < len(atoms):
+            residue_coords.append(atoms[atom_center_idx]["coords"])
+        else:
+            # Fallback: use first atom of residue if center atom not available
+            atom_idx = res_tuple[3]  # atom_idx is 4th field (0-indexed: 3)
+            if atom_idx < len(atoms):
+                residue_coords.append(atoms[atom_idx]["coords"])
+            else:
+                residue_coords.append((0.0, 0.0, 0.0))
+    
+    # Compute water fractional credit
+    water_counts = compute_water_fractional_credit(
+        water_coords=water_coords,
+        residue_coords=np.array(residue_coords, dtype=np.float32),
+        max_distance=10.0,
+        temperature=1.0,
+    )
+    
+    # Add water_counts to res_data tuples
+    res_data_with_water_counts = []
+    for i, res_tuple in enumerate(res_data):
+        res_data_with_water_counts.append(res_tuple + (water_counts[i],))
+    res_data = res_data_with_water_counts
+    
     residues = np.array(res_data, dtype=Residue)
     chains = np.array(chain_data, dtype=Chain)
     connections = np.array(connection_data, dtype=Connection)
