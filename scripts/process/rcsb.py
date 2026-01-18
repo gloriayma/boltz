@@ -282,33 +282,44 @@ def process_structure(
             use_timeout = False
 
     try:
-        try:
-            # Parse the target
-            target: Target = parse(data, resource, clusters)
-            structure = target.structure
+        # Parse the target
+        target: Target = parse(data, resource, clusters)
+        structure = target.structure
 
-            # Apply the filters
-            mask = structure.mask
-            if filters is not None:
-                for f in filters:
-                    filter_mask = f.filter(structure)
-                    mask = mask & filter_mask
-        except TimeoutException:
-            # Timeout occurred, skip this structure
-            print(f"Skipping {data.id} - processing took longer than {TIMEOUT_SECONDS} seconds")  # noqa: T201
-            return
-        except Exception:  # noqa: BLE001
-            traceback.print_exc()
-            print(f"Failed to parse {data.id}")  # noqa: T201
-            return
-        finally:
-            # Always cancel the alarm and restore handler if timeout was used
-            if use_timeout and old_handler is not None:
-                try:
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
-                except (AttributeError, ValueError):
-                    pass
+        # Apply the filters
+        mask = structure.mask
+        if filters is not None:
+            for f in filters:
+                filter_mask = f.filter(structure)
+                mask = mask & filter_mask
+    except TimeoutException:
+        # Timeout occurred, skip this structure
+        print(f"Skipping {data.id} - processing took longer than {TIMEOUT_SECONDS} seconds")  # noqa: T201
+        if use_timeout and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
+        return
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        print(f"Failed to parse {data.id}")  # noqa: T201
+        if use_timeout and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
+        return
+    finally:
+        # Always cancel the alarm and restore handler if timeout was used
+        if use_timeout and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
 
     # Replace chains and interfaces
     chains = []
