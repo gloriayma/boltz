@@ -878,10 +878,13 @@ def compute_water_fractional_credit(
 
     logits = np.where(within_radius, -distances / temperature, -np.inf)  # (num_waters, num_residues)
 
-
     max_logits = np.max(logits, axis=1, keepdims=True)  # (num_waters, 1)
 
-    logits_stable = logits - max_logits  # (num_waters, num_residues)
+    # Compute stable logits for numerical stability
+    # Note: When a water has no nearby residues, max_logits will be -inf,
+    # and subtracting produces NaN, but we handle this correctly below
+    with np.errstate(invalid='ignore'):
+        logits_stable = logits - max_logits  # (num_waters, num_residues)
 
     exp_logits = np.where(np.isfinite(logits_stable), np.exp(logits_stable), 0.0)  # (num_waters, num_residues)
 
