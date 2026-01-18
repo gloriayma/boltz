@@ -263,12 +263,16 @@ class ConfidenceHeads(nn.Module):
         if self.token_level_confidence:
             self.to_plddt_logits = LinearNoBias(token_s, num_plddt_bins)
             self.to_resolved_logits = LinearNoBias(token_s, 2)
+            self.to_water_counts = LinearNoBias(token_s, 1)
         else:
             self.to_plddt_logits = LinearNoBias(
                 token_s, num_plddt_bins * self.max_num_atoms_per_token
             )
             self.to_resolved_logits = LinearNoBias(
                 token_s, 2 * self.max_num_atoms_per_token
+            )
+            self.to_water_counts = LinearNoBias(
+                token_s, self.max_num_atoms_per_token
             )
 
     def forward(
@@ -313,6 +317,7 @@ class ConfidenceHeads(nn.Module):
             pde_logits = self.to_pde_logits(z + z.transpose(1, 2))
         resolved_logits = self.to_resolved_logits(s)
         plddt_logits = self.to_plddt_logits(s)
+        water_counts_raw = self.to_water_counts(s)  # [B, N, 1] or [B, N, max_atoms]
 
         ligand_weight = 20
         non_interface_weight = 1
@@ -349,6 +354,9 @@ class ConfidenceHeads(nn.Module):
             complex_iplddt = (plddt * token_pad_mask * iplddt_weight).sum(
                 dim=-1
             ) / torch.sum(token_pad_mask * iplddt_weight, dim=-1)
+            
+            # Extract water_counts for token-level confidence
+            water_counts = water_counts_raw.squeeze(-1)  # [B, N]
 
         else:
             # token to atom conversion for resolved logits
@@ -394,6 +402,22 @@ class ConfidenceHeads(nn.Module):
                 ),
                 value=0,
             )
+            
+            # Handle water_counts for atom-level confidence
+            water_counts = water_counts_raw.reshape(B, N, self.max_num_atoms_per_token)
+            water_counts = water_counts[:, max_num_atoms_mask.squeeze(0)]
+            water_counts = pad(
+                water_counts,
+                (
+                    0,
+                    int(
+                        feats["atom_pad_mask"].shape[1]
+                        - feats["atom_pad_mask"].sum().item()
+                    ),
+                ),
+                value=0,
+            )
+            
             atom_pad_mask = feats["atom_pad_mask"].repeat_interleave(multiplicity, 0)
             plddt = compute_aggregated_metric(plddt_logits)
 
@@ -465,6 +489,7 @@ class ConfidenceHeads(nn.Module):
             pde_logits=pde_logits,
             plddt_logits=plddt_logits,
             resolved_logits=resolved_logits,
+            water_counts=water_counts,
             pde=pde,
             plddt=plddt,
             complex_plddt=complex_plddt,

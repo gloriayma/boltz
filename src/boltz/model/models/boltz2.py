@@ -18,6 +18,9 @@ from boltz.model.loss.bfactor import bfactor_loss_fn
 from boltz.model.loss.confidencev2 import (
     confidence_loss,
 )
+from boltz.model.loss.water_counts import (
+    water_counts_loss,
+)
 from boltz.model.loss.distogramv2 import distogram_loss
 from boltz.model.modules.affinity import AffinityModule
 from boltz.model.modules.confidencev2 import ConfidenceModule
@@ -143,6 +146,7 @@ class Boltz2(LightningModule):
                 "resolved_loss",
                 "pde_loss",
                 "pae_loss",
+                "water_counts_loss",
             ]:
                 self.train_confidence_loss_dict_logger[m] = MeanMetric()
 
@@ -846,45 +850,57 @@ class Boltz2(LightningModule):
             diffusion_loss_dict = {"loss": 0.0, "loss_breakdown": {}}
 
         if self.confidence_prediction:
-            try:
-                # confidence model symmetry correction
-                return_dict = self.get_true_coordinates(
-                    batch,
-                    out,
-                    diffusion_samples=self.training_args.diffusion_samples,
-                    symmetry_correction=self.training_args.symmetry_correction,
+            # Check if we're training water counts only
+            water_counts_only = self.training_args.get("water_counts_only", False)
+            
+            if water_counts_only and "water_counts" in out:
+                # Use standalone water_counts_loss (no confidence losses)
+                confidence_loss_dict = water_counts_loss(
+                    pred_water_counts=out["water_counts"],
+                    feats=batch,
+                    token_level_confidence=self.token_level_confidence,
+                    multiplicity=self.training_args.diffusion_samples,
                 )
-            except Exception as e:
-                print(f"Skipping batch with id {batch['pdb_id']} due to error: {e}")
-                return None
+            else:
+                try:
+                    # confidence model symmetry correction
+                    return_dict = self.get_true_coordinates(
+                        batch,
+                        out,
+                        diffusion_samples=self.training_args.diffusion_samples,
+                        symmetry_correction=self.training_args.symmetry_correction,
+                    )
+                except Exception as e:
+                    print(f"Skipping batch with id {batch['pdb_id']} due to error: {e}")
+                    return None
 
-            true_coords = return_dict["true_coords"]
-            true_coords_resolved_mask = return_dict["true_coords_resolved_mask"]
+                true_coords = return_dict["true_coords"]
+                true_coords_resolved_mask = return_dict["true_coords_resolved_mask"]
 
-            # TODO remove once multiple conformers are supported
-            K = true_coords.shape[1]
-            assert K == 1, (
-                f"Confidence_prediction is not supported for num_ensembles_val={K}."
-            )
+                # TODO remove once multiple conformers are supported
+                K = true_coords.shape[1]
+                assert K == 1, (
+                    f"Confidence_prediction is not supported for num_ensembles_val={K}."
+                )
 
-            # For now, just take the only conformer.
-            true_coords = true_coords.squeeze(1)  # (S, L, 3)
-            batch["frames_idx"] = batch["frames_idx"].squeeze(
-                1
-            )  # remove conformer dimension
-            batch["frame_resolved_mask"] = batch["frame_resolved_mask"].squeeze(
-                1
-            )  # remove conformer dimension
+                # For now, just take the only conformer.
+                true_coords = true_coords.squeeze(1)  # (S, L, 3)
+                batch["frames_idx"] = batch["frames_idx"].squeeze(
+                    1
+                )  # remove conformer dimension
+                batch["frame_resolved_mask"] = batch["frame_resolved_mask"].squeeze(
+                    1
+                )  # remove conformer dimension
 
-            confidence_loss_dict = confidence_loss(
-                out,
-                batch,
-                true_coords,
-                true_coords_resolved_mask,
-                token_level_confidence=self.token_level_confidence,
-                alpha_pae=self.alpha_pae,
-                multiplicity=self.training_args.diffusion_samples,
-            )
+                confidence_loss_dict = confidence_loss(
+                    out,
+                    batch,
+                    true_coords,
+                    true_coords_resolved_mask,
+                    token_level_confidence=self.token_level_confidence,
+                    alpha_pae=self.alpha_pae,
+                    multiplicity=self.training_args.diffusion_samples,
+                )
 
         else:
             confidence_loss_dict = {
