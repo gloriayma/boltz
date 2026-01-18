@@ -90,6 +90,22 @@ class Resource:
         """Get an item from the resource."""
         out = self.get(key)
         if out is None:
+            # Check if we're trying to access components and it's empty
+            if key == "components":
+                raise KeyError(
+                    "Components dictionary is empty. "
+                    "CCD components are required for parsing structures. "
+                    "Please provide --ccd argument with a ccd.pkl file, "
+                    "or use Redis with ccd.rdb file."
+                )
+            # Check if we're trying to access a component that's missing
+            if not self._use_redis and len(self._components) == 0:
+                raise KeyError(
+                    f"Component '{key}' not found. "
+                    "CCD components dictionary is empty. "
+                    "Please provide --ccd argument with a ccd.pkl file, "
+                    "or use Redis with ccd.rdb file."
+                )
             raise KeyError(key)
         return out
 
@@ -98,7 +114,11 @@ def fetch(datadir: Path, max_file_size: Optional[int] = None) -> list[PDB]:
     """Fetch the PDB files."""
     data = []
     excluded = 0
-    for file in datadir.rglob("*.cif*"):
+    
+    # Use tqdm to show progress while scanning
+    # Note: total count unknown initially, so progress bar will update as we go
+    file_iterator = datadir.rglob("*.cif*")
+    for file in tqdm(file_iterator, desc="Scanning for files", unit="file"):
         # The clustering file is annotated by pdb_entity id
         pdb_id = str(file.stem).lower()
 
@@ -169,7 +189,9 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
     pdb_id = data.id.lower()
 
     # Parse structure
-    parsed = parse_mmcif(data.path, resource)
+    # Extract components dict from resource
+    components = resource["components"]
+    parsed = parse_mmcif(data.path, components)
     structure = parsed.data
     structure_info = parsed.info
 
