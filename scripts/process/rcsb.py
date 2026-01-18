@@ -234,6 +234,9 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
     return Target(structure=structure, record=record)
 
 
+# Counter to track how many structures have been processed (for debug output)
+_processed_count = 0
+
 def process_structure(
     data: PDB,
     resource: Resource,
@@ -241,6 +244,7 @@ def process_structure(
     filters: list[StaticFilter],
     clusters: dict,
 ) -> None:
+    global _processed_count
     """Process a target.
 
     Parameters
@@ -301,6 +305,7 @@ def process_structure(
                 signal.signal(signal.SIGALRM, old_handler)
             except (AttributeError, ValueError):
                 pass
+        _processed_count += 1
         return
     except Exception:  # noqa: BLE001
         traceback.print_exc()
@@ -311,6 +316,7 @@ def process_structure(
                 signal.signal(signal.SIGALRM, old_handler)
             except (AttributeError, ValueError):
                 pass
+        _processed_count += 1
         return
     finally:
         # Always cancel the alarm and restore handler if timeout was used
@@ -320,6 +326,33 @@ def process_structure(
                 signal.signal(signal.SIGALRM, old_handler)
             except (AttributeError, ValueError):
                 pass
+
+    # Debug output: Print water_counts for first 10 structures
+    if _processed_count < 10:
+        water_counts = structure.residues["water_counts"]
+        non_zero_count = np.sum(water_counts > 0)
+        total_residues = len(water_counts)
+        max_water_count = np.max(water_counts)
+        mean_water_count = np.mean(water_counts[water_counts > 0]) if non_zero_count > 0 else 0.0
+        
+        print(f"\n=== Structure {_processed_count + 1}: {data.id} ===")  # noqa: T201
+        print(f"  Total residues: {total_residues}")  # noqa: T201
+        print(f"  Residues with water_counts > 0: {non_zero_count}")  # noqa: T201
+        print(f"  Max water_count: {max_water_count:.4f}")  # noqa: T201
+        print(f"  Mean water_count (non-zero): {mean_water_count:.4f}")  # noqa: T201
+        
+        # Print first 10 non-zero water_counts
+        non_zero_indices = np.where(water_counts > 0)[0][:10]
+        if len(non_zero_indices) > 0:
+            print(f"  Sample water_counts (first {len(non_zero_indices)} non-zero):")  # noqa: T201
+            for idx in non_zero_indices:
+                res_name = structure.residues[idx]["name"]
+                print(f"    Residue {idx} ({res_name}): {water_counts[idx]:.4f}")  # noqa: T201
+        else:
+            print(f"  No residues with water_counts > 0")  # noqa: T201
+        print()  # noqa: T201
+        
+        _processed_count += 1
 
     # Replace chains and interfaces
     chains = []
