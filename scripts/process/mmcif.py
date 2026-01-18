@@ -755,7 +755,7 @@ def parse_connection(
     connection: gemmi.Connection,
     chains: list[ParsedChain],
     subchain_map: dict[tuple[str, int], str],
-) -> ParsedConnection:
+) -> Optional[ParsedConnection]:
     """Parse (covalent) connection from a gemmi Connection.
 
     Parameters
@@ -783,36 +783,53 @@ def parse_connection(
     res_2_id = connection.partner2.res_id.seqid
     res_2_id = str(res_2_id.num) + str(res_2_id.icode).strip()
 
-    subchain_1 = subchain_map[(chain_1_name, res_1_id)]
-    subchain_2 = subchain_map[(chain_2_name, res_2_id)]
+    # Check if subchains exist in map
+    try:
+        subchain_1 = subchain_map[(chain_1_name, res_1_id)]
+        subchain_2 = subchain_map[(chain_2_name, res_2_id)]
+    except KeyError:
+        # Connection references a residue that wasn't parsed, skip it
+        return None
 
-    # Get chain indices
-    chain_1 = next(chain for chain in chains if (chain.name == subchain_1))
-    chain_2 = next(chain for chain in chains if (chain.name == subchain_2))
+    # Get chain indices - handle missing chains gracefully
+    try:
+        chain_1 = next(chain for chain in chains if (chain.name == subchain_1))
+        chain_2 = next(chain for chain in chains if (chain.name == subchain_2))
+    except StopIteration:
+        # Chain not found in parsed chains, skip this connection
+        return None
 
-    # Get residue indices
-    res_1_idx, res_1 = next(
-        (idx, res)
-        for idx, res in enumerate(chain_1.residues)
-        if (res.orig_idx == res_1_id)
-    )
-    res_2_idx, res_2 = next(
-        (idx, res)
-        for idx, res in enumerate(chain_2.residues)
-        if (res.orig_idx == res_2_id)
-    )
+    # Get residue indices - handle missing residues gracefully
+    try:
+        res_1_idx, res_1 = next(
+            (idx, res)
+            for idx, res in enumerate(chain_1.residues)
+            if (res.orig_idx == res_1_id)
+        )
+        res_2_idx, res_2 = next(
+            (idx, res)
+            for idx, res in enumerate(chain_2.residues)
+            if (res.orig_idx == res_2_id)
+        )
+    except StopIteration:
+        # Residue not found, skip this connection
+        return None
 
-    # Get atom indices
-    atom_index_1 = next(
-        idx
-        for idx, atom in enumerate(res_1.atoms)
-        if atom.name == connection.partner1.atom_name
-    )
-    atom_index_2 = next(
-        idx
-        for idx, atom in enumerate(res_2.atoms)
-        if atom.name == connection.partner2.atom_name
-    )
+    # Get atom indices - handle missing atoms gracefully
+    try:
+        atom_index_1 = next(
+            idx
+            for idx, atom in enumerate(res_1.atoms)
+            if atom.name == connection.partner1.atom_name
+        )
+        atom_index_2 = next(
+            idx
+            for idx, atom in enumerate(res_2.atoms)
+            if atom.name == connection.partner2.atom_name
+        )
+    except StopIteration:
+        # Atom not found, skip this connection
+        return None
 
     conn = ParsedConnection(
         chain_1=subchain_1,
@@ -1097,7 +1114,9 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
             chains=chains,
             subchain_map=subchain_map,
         )
-        connections.append(parsed_connection)
+        # Skip connections that couldn't be parsed (missing chains/residues)
+        if parsed_connection is not None:
+            connections.append(parsed_connection)
 
     # Create tables
     atom_data = []
