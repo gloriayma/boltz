@@ -2,6 +2,7 @@ import argparse
 import json
 import multiprocessing
 import pickle
+import signal
 import traceback
 from dataclasses import asdict, dataclass, replace
 from functools import partial
@@ -259,21 +260,55 @@ def process_structure(
     if struct_path.exists() and record_path.exists():
         return
 
-    try:
-        # Parse the target
-        target: Target = parse(data, resource, clusters)
-        structure = target.structure
+    # Timeout handler for structures taking too long
+    class TimeoutException(Exception):
+        pass
 
-        # Apply the filters
-        mask = structure.mask
-        if filters is not None:
-            for f in filters:
-                filter_mask = f.filter(structure)
-                mask = mask & filter_mask
-    except Exception:  # noqa: BLE001
-        traceback.print_exc()
-        print(f"Failed to parse {data.id}")
-        return
+    def timeout_handler(signum, frame):
+        raise TimeoutException()
+
+    TIMEOUT_SECONDS = 30
+    
+    # Set up timeout (Unix only - signal.SIGALRM not available on Windows)
+    use_timeout = hasattr(signal, 'SIGALRM')
+    old_handler = None
+    
+    if use_timeout:
+        try:
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(TIMEOUT_SECONDS)
+        except (AttributeError, ValueError):
+            # Signal not available or not supported
+            use_timeout = False
+
+    try:
+        try:
+            # Parse the target
+            target: Target = parse(data, resource, clusters)
+            structure = target.structure
+
+            # Apply the filters
+            mask = structure.mask
+            if filters is not None:
+                for f in filters:
+                    filter_mask = f.filter(structure)
+                    mask = mask & filter_mask
+        except TimeoutException:
+            # Timeout occurred, skip this structure
+            print(f"Skipping {data.id} - processing took longer than {TIMEOUT_SECONDS} seconds")  # noqa: T201
+            return
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            print(f"Failed to parse {data.id}")  # noqa: T201
+            return
+        finally:
+            # Always cancel the alarm and restore handler if timeout was used
+            if use_timeout and old_handler is not None:
+                try:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+                except (AttributeError, ValueError):
+                    pass
 
     # Replace chains and interfaces
     chains = []

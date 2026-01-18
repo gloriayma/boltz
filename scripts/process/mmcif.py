@@ -794,9 +794,14 @@ def parse_connection(
     # Get chain indices - handle missing chains gracefully
     try:
         chain_1 = next(chain for chain in chains if (chain.name == subchain_1))
+    except StopIteration:
+        # Chain 1 not found in parsed chains, skip this connection
+        return None
+    
+    try:
         chain_2 = next(chain for chain in chains if (chain.name == subchain_2))
     except StopIteration:
-        # Chain not found in parsed chains, skip this connection
+        # Chain 2 not found in parsed chains, skip this connection
         return None
 
     # Get residue indices - handle missing residues gracefully
@@ -806,13 +811,18 @@ def parse_connection(
             for idx, res in enumerate(chain_1.residues)
             if (res.orig_idx == res_1_id)
         )
+    except StopIteration:
+        # Residue 1 not found, skip this connection
+        return None
+    
+    try:
         res_2_idx, res_2 = next(
             (idx, res)
             for idx, res in enumerate(chain_2.residues)
             if (res.orig_idx == res_2_id)
         )
     except StopIteration:
-        # Residue not found, skip this connection
+        # Residue 2 not found, skip this connection
         return None
 
     # Get atom indices - handle missing atoms gracefully
@@ -822,13 +832,18 @@ def parse_connection(
             for idx, atom in enumerate(res_1.atoms)
             if atom.name == connection.partner1.atom_name
         )
+    except StopIteration:
+        # Atom 1 not found, skip this connection
+        return None
+    
+    try:
         atom_index_2 = next(
             idx
             for idx, atom in enumerate(res_2.atoms)
             if atom.name == connection.partner2.atom_name
         )
     except StopIteration:
-        # Atom not found, skip this connection
+        # Atom 2 not found, skip this connection
         return None
 
     conn = ParsedConnection(
@@ -1236,12 +1251,21 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
                 residue_coords.append((0.0, 0.0, 0.0))
     
     # Compute water fractional credit
-    water_counts = compute_water_fractional_credit(
-        water_coords=water_coords,
-        residue_coords=np.array(residue_coords, dtype=np.float32),
-        max_distance=10.0,
-        temperature=1.0,
-    )
+    # Limit water processing for very large structures to avoid stalling
+    # Structures with > 50,000 waters can take prohibitively long
+    MAX_WATERS = 50000
+    if len(water_coords) > MAX_WATERS:
+        # For very large structures, skip water counts computation
+        # This prevents stalling on structures with excessive waters
+        print(f"Warning: Structure has {len(water_coords)} waters, skipping water counts computation to avoid stalling")  # noqa: T201
+        water_counts = np.zeros(len(residue_coords), dtype=np.float32)
+    else:
+        water_counts = compute_water_fractional_credit(
+            water_coords=water_coords,
+            residue_coords=np.array(residue_coords, dtype=np.float32),
+            max_distance=10.0,
+            temperature=1.0,
+        )
     
     # Add water_counts to res_data tuples
     res_data_with_water_counts = []
