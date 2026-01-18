@@ -657,10 +657,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     cyclic_period = from_numpy(token_data["cyclic_period"].copy())
     affinity_mask = from_numpy(token_data["affinity_mask"]).float()
 
-    # Extract water_counts from structure residues and map to tokens
-    # Each token has a res_idx that maps to a residue in data.structure.residues
-    water_counts = from_numpy(data.structure.residues[token_data["res_idx"]]["water_counts"]).float()
-
     ## Conditioning features ##
     method = (
         np.zeros(len(token_data))
@@ -1088,7 +1084,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
             modified = pad_dim(modified, 0, pad_len)
             cyclic_period = pad_dim(cyclic_period, 0, pad_len)
             affinity_mask = pad_dim(affinity_mask, 0, pad_len)
-            water_counts = pad_dim(water_counts, 0, pad_len)
 
     token_features = {
         "token_index": token_index,
@@ -1110,7 +1105,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         "modified": modified,
         "cyclic_period": cyclic_period,
         "affinity_token_mask": affinity_mask,
-        "water_counts": water_counts,
     }
 
     return token_features
