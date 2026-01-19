@@ -2,6 +2,7 @@ import argparse
 import json
 import multiprocessing
 import pickle
+import signal
 import traceback
 from dataclasses import asdict, dataclass, replace
 from functools import partial
@@ -10,10 +11,18 @@ from typing import Any, Optional
 
 import numpy as np
 import rdkit
-from mmcif import parse_mmcif
 from p_tqdm import p_umap
-from redis import Redis
 from tqdm import tqdm
+
+# Import parse_mmcif from the same directory
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from mmcif import parse_mmcif
+
+try:
+    from redis import Redis
+except ImportError:
+    Redis = None  # type: ignore
 
 from boltz.data.filter.static.filter import StaticFilter
 from boltz.data.filter.static.ligand import ExcludedLigands
@@ -37,21 +46,67 @@ class PDB:
 class Resource:
     """A shared resource for processing."""
 
-    def __init__(self, host: str, port: int) -> None:
-        """Initialize the redis database."""
-        self._redis = Redis(host=host, port=port)
+    def __init__(self, host: Optional[str] = None, port: Optional[int] = None, ccd_path: Optional[Path] = None) -> None:
+        """Initialize the resource from Redis or pickle file.
+        
+        Parameters
+        ----------
+        host : str, optional
+            Redis host. If None, will load from pickle file.
+        port : int, optional
+            Redis port. If None, will load from pickle file.
+        ccd_path : Path, optional
+            Path to ccd.pkl or ccd.rdb file. If provided, loads components from file instead of Redis.
+        """
+        if ccd_path is not None:
+            # Load from pickle file
+            self._use_redis = False
+            with ccd_path.open("rb") as f:
+                self._components = pickle.load(f)  # noqa: S301
+        elif host is not None and port is not None:
+            # Load from Redis
+            if Redis is None:
+                raise ImportError("Redis is not installed. Use --ccd to load from pickle file instead.")
+            self._use_redis = True
+            self._redis = Redis(host=host, port=port)
+        else:
+            # Default: empty components dict (for structures without ligands)
+            self._use_redis = False
+            self._components = {}
 
     def get(self, key: str) -> Any:  # noqa: ANN401
-        """Get an item from the Redis database."""
-        value = self._redis.get(key)
-        if value is not None:
-            value = pickle.loads(value)  # noqa: S301
-        return value
+        """Get an item from the resource."""
+        if self._use_redis:
+            value = self._redis.get(key)
+            if value is not None:
+                value = pickle.loads(value)  # noqa: S301
+            return value
+        else:
+            # Load from pickle file or return from cache
+            if key == "components":
+                return self._components
+            return None
 
     def __getitem__(self, key: str) -> Any:  # noqa: ANN401
         """Get an item from the resource."""
         out = self.get(key)
         if out is None:
+            # Check if we're trying to access components and it's empty
+            if key == "components":
+                raise KeyError(
+                    "Components dictionary is empty. "
+                    "CCD components are required for parsing structures. "
+                    "Please provide --ccd argument with a ccd.pkl file, "
+                    "or use Redis with ccd.rdb file."
+                )
+            # Check if we're trying to access a component that's missing
+            if not self._use_redis and len(self._components) == 0:
+                raise KeyError(
+                    f"Component '{key}' not found. "
+                    "CCD components dictionary is empty. "
+                    "Please provide --ccd argument with a ccd.pkl file, "
+                    "or use Redis with ccd.rdb file."
+                )
             raise KeyError(key)
         return out
 
@@ -60,7 +115,11 @@ def fetch(datadir: Path, max_file_size: Optional[int] = None) -> list[PDB]:
     """Fetch the PDB files."""
     data = []
     excluded = 0
-    for file in datadir.rglob("*.cif*"):
+    
+    # Use tqdm to show progress while scanning
+    # Note: total count unknown initially, so progress bar will update as we go
+    file_iterator = datadir.rglob("*.cif*")
+    for file in tqdm(file_iterator, desc="Scanning for files", unit="file"):
         # The clustering file is annotated by pdb_entity id
         pdb_id = str(file.stem).lower()
 
@@ -73,7 +132,8 @@ def fetch(datadir: Path, max_file_size: Optional[int] = None) -> list[PDB]:
         target = PDB(id=pdb_id, path=str(file))
         data.append(target)
 
-    print(f"Excluded {excluded} files due to size.")  # noqa: T201
+    if excluded > 0:
+        print(f"Excluded {excluded} files due to size.")  # noqa: T201
     return data
 
 
@@ -130,7 +190,9 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
     pdb_id = data.id.lower()
 
     # Parse structure
-    parsed = parse_mmcif(data.path, resource)
+    # Extract components dict from resource
+    components = resource["components"]
+    parsed = parse_mmcif(data.path, components)
     structure = parsed.data
     structure_info = parsed.info
 
@@ -198,6 +260,27 @@ def process_structure(
     if struct_path.exists() and record_path.exists():
         return
 
+    # Timeout handler for structures taking too long
+    class TimeoutException(Exception):
+        pass
+
+    def timeout_handler(signum, frame):
+        raise TimeoutException()
+
+    TIMEOUT_SECONDS = 30
+    
+    # Set up timeout (Unix only - signal.SIGALRM not available on Windows)
+    use_timeout = hasattr(signal, 'SIGALRM')
+    old_handler = None
+    
+    if use_timeout:
+        try:
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(TIMEOUT_SECONDS)
+        except (AttributeError, ValueError):
+            # Signal not available or not supported
+            use_timeout = False
+
     try:
         # Parse the target
         target: Target = parse(data, resource, clusters)
@@ -209,10 +292,34 @@ def process_structure(
             for f in filters:
                 filter_mask = f.filter(structure)
                 mask = mask & filter_mask
+    except TimeoutException:
+        # Timeout occurred, skip this structure
+        print(f"Skipping {data.id} - processing took longer than {TIMEOUT_SECONDS} seconds")  # noqa: T201
+        if use_timeout and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
+        return
     except Exception:  # noqa: BLE001
         traceback.print_exc()
-        print(f"Failed to parse {data.id}")
+        print(f"Failed to parse {data.id}")  # noqa: T201
+        if use_timeout and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
         return
+    finally:
+        # Always cancel the alarm and restore handler if timeout was used
+        if use_timeout and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
 
     # Replace chains and interfaces
     chains = []
@@ -251,9 +358,11 @@ def process(args) -> None:
     structure_dir.mkdir(parents=True, exist_ok=True)
 
     # Load clusters
+    print(f"Loading clusters from {args.clusters}...")  # noqa: T201
     with Path(args.clusters).open("r") as f:
         clusters: dict[str, str] = json.load(f)
         clusters = {k.lower(): v.lower() for k, v in clusters.items()}
+    print(f"Loaded {len(clusters)} cluster assignments.")  # noqa: T201
 
     # Load filters
     filters = [
@@ -268,12 +377,20 @@ def process(args) -> None:
     pickle_option = rdkit.Chem.PropertyPickleOptions.AllProps
     rdkit.Chem.SetDefaultPickleProperties(pickle_option)
 
-    # Load shared data from redis
-    resource = Resource(host=args.redis_host, port=args.redis_port)
+    # Load shared data from redis or pickle file
+    if args.ccd is not None:
+        print(f"Loading CCD components from {args.ccd}...")  # noqa: T201
+        resource = Resource(ccd_path=args.ccd)
+        print("CCD components loaded.")  # noqa: T201
+    else:
+        print(f"Connecting to Redis at {args.redis_host}:{args.redis_port}...")  # noqa: T201
+        resource = Resource(host=args.redis_host, port=args.redis_port)
+        print("Connected to Redis.")  # noqa: T201
 
     # Get data points
-    print("Fetching data...")
+    print("Fetching data...")  # noqa: T201
     data = fetch(args.datadir)
+    print(f"Found {len(data)} files to process.")  # noqa: T201
 
     # Check if we can run in parallel
     max_processes = multiprocessing.cpu_count()
@@ -281,8 +398,8 @@ def process(args) -> None:
     parallel = num_processes > 1
 
     # Run processing
-    print("Processing data...")
     if parallel:
+        print(f"Processing {len(data)} files in parallel using {num_processes} processes...")  # noqa: T201
         # Create processing function
         fn = partial(
             process_structure,
@@ -294,7 +411,8 @@ def process(args) -> None:
         # Run processing in parallel
         p_umap(fn, data, num_cpus=num_processes)
     else:
-        for item in tqdm(data):
+        print(f"Processing {len(data)} files sequentially...")  # noqa: T201
+        for item in tqdm(data, desc="Processing structures"):
             process_structure(
                 item,
                 resource=resource,
@@ -344,6 +462,12 @@ if __name__ == "__main__":
         type=int,
         default=7777,
         help="The Redis port.",
+    )
+    parser.add_argument(
+        "--ccd",
+        type=Path,
+        default=None,
+        help="Path to ccd.pkl or ccd.rdb file. If provided, loads components from file instead of Redis.",
     )
     parser.add_argument(
         "--use-assembly",

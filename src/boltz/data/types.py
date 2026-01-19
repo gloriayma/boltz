@@ -126,6 +126,7 @@ Residue = [
     ("atom_disto", np.dtype("i4")),
     ("is_standard", np.dtype("?")),
     ("is_present", np.dtype("?")),
+    ("water_counts", np.dtype("f4")),
 ]
 
 Chain = [
@@ -193,10 +194,25 @@ class Structure(NumpySerializable):
 
         """
         structure = np.load(path)
+        residues = structure["residues"]
+        
+        # Handle backward compatibility: add water_counts field if missing
+        if "water_counts" not in residues.dtype.names:
+            # Create a new dtype with the additional field
+            new_dtype = residues.dtype.descr + [("water_counts", "f4")]
+            # Create a new array with the new dtype
+            new_residues = np.empty(residues.shape, dtype=new_dtype)
+            # Copy over existing fields
+            for name in residues.dtype.names:
+                new_residues[name] = residues[name]
+            # Set the new field to 0.0 (default for old files without water_counts)
+            new_residues["water_counts"] = 0.0
+            residues = new_residues
+        
         return cls(
             atoms=structure["atoms"],
             bonds=structure["bonds"],
-            residues=structure["residues"],
+            residues=residues,
             chains=structure["chains"],
             connections=structure["connections"].astype(Connection),
             interfaces=structure["interfaces"],

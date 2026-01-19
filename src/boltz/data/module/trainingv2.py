@@ -101,10 +101,25 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
     """
     # Load the structure
     structure = np.load(target_dir / "structures" / f"{record.id}.npz")
+    
+    # Handle backward compatibility: add water_counts field to residues if missing
+    residues = structure["residues"]
+    if "water_counts" not in residues.dtype.names:
+        # Create a new dtype with the additional field
+        new_dtype = residues.dtype.descr + [("water_counts", "f4")]
+        # Create a new array with the new dtype
+        new_residues = np.empty(residues.shape, dtype=new_dtype)
+        # Copy over existing fields
+        for name in residues.dtype.names:
+            new_residues[name] = residues[name]
+        # Set the new field to 0.0 (default for old files without water_counts)
+        new_residues["water_counts"] = 0.0
+        residues = new_residues
+    
     structure = Structure(
         atoms=structure["atoms"],
         bonds=structure["bonds"],
-        residues=structure["residues"],
+        residues=residues,
         chains=structure["chains"],
         connections=structure["connections"].astype(Connection),
         interfaces=structure["interfaces"],

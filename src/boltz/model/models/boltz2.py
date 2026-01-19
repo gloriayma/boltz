@@ -19,8 +19,10 @@ from boltz.model.loss.confidencev2 import (
     confidence_loss,
 )
 from boltz.model.loss.distogramv2 import distogram_loss
+from boltz.model.loss.water_counts import water_counts_loss
 from boltz.model.modules.affinity import AffinityModule
 from boltz.model.modules.confidencev2 import ConfidenceModule
+from boltz.model.modules.water_counts_module import WaterCountsModule
 from boltz.model.modules.diffusion_conditioning import DiffusionConditioning
 from boltz.model.modules.diffusionv2 import AtomDiffusion
 from boltz.model.modules.encodersv2 import RelativePositionEncoder
@@ -56,6 +58,7 @@ class Boltz2(LightningModule):
         diffusion_process_args: dict[str, Any],
         diffusion_loss_args: dict[str, Any],
         confidence_model_args: Optional[dict[str, Any]] = None,
+        water_counts_model_args: Optional[dict[str, Any]] = None,
         affinity_model_args: Optional[dict[str, Any]] = None,
         affinity_model_args1: Optional[dict[str, Any]] = None,
         affinity_model_args2: Optional[dict[str, Any]] = None,
@@ -64,6 +67,7 @@ class Boltz2(LightningModule):
         atom_feature_dim: int = 128,
         template_args: Optional[dict] = None,
         confidence_prediction: bool = True,
+        water_counts_prediction: bool = False,
         affinity_prediction: bool = False,
         affinity_ensemble: bool = False,
         affinity_mw_correction: bool = True,
@@ -145,6 +149,9 @@ class Boltz2(LightningModule):
                 "pae_loss",
             ]:
                 self.train_confidence_loss_dict_logger[m] = MeanMetric()
+
+        if water_counts_prediction:
+            self.train_water_counts_loss_logger = MeanMetric()
 
         self.exclude_ions_from_lddt = exclude_ions_from_lddt
 
@@ -292,6 +299,7 @@ class Boltz2(LightningModule):
             self.bfactor_module = BFactorModule(token_s, num_bins)
 
         self.confidence_prediction = confidence_prediction
+        self.water_counts_prediction = water_counts_prediction
         self.affinity_prediction = affinity_prediction
         self.affinity_ensemble = affinity_ensemble
         self.affinity_mw_correction = affinity_mw_correction
@@ -316,6 +324,25 @@ class Boltz2(LightningModule):
             if compile_confidence:
                 self.confidence_module = torch.compile(
                     self.confidence_module, dynamic=False, fullgraph=False
+                )
+
+        if self.water_counts_prediction:
+            if water_counts_model_args is None:
+                water_counts_model_args = {}
+            self.water_counts_module = WaterCountsModule(
+                token_s,
+                token_z,
+                bond_type_feature=bond_type_feature,
+                fix_sym_check=fix_sym_check,
+                cyclic_pos_enc=cyclic_pos_enc,
+                conditioning_cutoff_min=conditioning_cutoff_min,
+                conditioning_cutoff_max=conditioning_cutoff_max,
+                pairformer_args=pairformer_args,
+                **water_counts_model_args,
+            )
+            if compile_confidence:  # Reuse compile_confidence flag for water_counts
+                self.water_counts_module = torch.compile(
+                    self.water_counts_module, dynamic=False, fullgraph=False
                 )
 
         if self.affinity_prediction:
@@ -352,7 +379,8 @@ class Boltz2(LightningModule):
         if not structure_prediction_training:
             for name, param in self.named_parameters():
                 if (
-                    name.split(".")[0] not in ["confidence_module", "affinity_module"]
+                    name.split(".")[0]
+                    not in ["confidence_module", "water_counts_module", "affinity_module"]
                     and "out_token_feat_update" not in name
                 ):
                     param.requires_grad = False
@@ -497,7 +525,11 @@ class Boltz2(LightningModule):
 
             if (
                 self.run_trunk_and_structure
-                and ((not self.training) or self.confidence_prediction)
+                and (
+                    (not self.training)
+                    or self.confidence_prediction
+                    or self.water_counts_prediction
+                )
                 and (not self.skip_run_structure)
             ):
                 if self.checkpoint_diffusion_conditioning and self.training:
@@ -599,6 +631,19 @@ class Boltz2(LightningModule):
                             :, :, :, 0
                         ].detach()  # TODO only implemented for 1 distogram
                     ),
+                    multiplicity=diffusion_samples,
+                    run_sequentially=run_confidence_sequentially,
+                    use_kernels=self.use_kernels,
+                )
+            )
+
+        if self.water_counts_prediction:
+            dict_out.update(
+                self.water_counts_module(
+                    s_inputs=s_inputs.detach(),
+                    s=s.detach(),
+                    z=z.detach(),
+                    feats=feats,
                     multiplicity=diffusion_samples,
                     run_sequentially=run_confidence_sequentially,
                     use_kernels=self.use_kernels,
@@ -892,6 +937,20 @@ class Boltz2(LightningModule):
                 "loss_breakdown": {},
             }
 
+        if self.water_counts_prediction:
+            water_counts_loss_dict = water_counts_loss(
+                pred_water_counts=out["water_counts"],
+                feats=batch,
+                multiplicity=self.training_args.diffusion_samples,
+                loss_type=self.training_args.get("water_counts_loss_type", "mse"),
+                delta=self.training_args.get("water_counts_loss_delta", 1.0),
+            )
+        else:
+            water_counts_loss_dict = {
+                "loss": torch.tensor(0.0, device=batch["token_index"].device),
+                "loss_breakdown": {},
+            }
+
         # Aggregate losses
         # NOTE: we already have an implicit weight in the losses induced by dataset sampling
         # NOTE: this logic works only for datasets with confidence labels
@@ -900,6 +959,8 @@ class Boltz2(LightningModule):
             + self.training_args.diffusion_loss_weight * diffusion_loss_dict["loss"]
             + self.training_args.distogram_loss_weight * disto_loss
             + self.training_args.get("bfactor_loss_weight", 0.0) * bfactor_loss
+            + self.training_args.get("water_counts_loss_weight", 0.0)
+            * water_counts_loss_dict["loss"]
         )
 
         if not (self.global_step % self.log_loss_every_steps):
@@ -924,6 +985,12 @@ class Boltz2(LightningModule):
                             else confidence_loss_dict["loss_breakdown"][k]
                         )
                     )
+
+            if self.water_counts_prediction:
+                self.train_water_counts_loss_logger.update(
+                    water_counts_loss_dict["loss"].detach()
+                )
+
             self.log("train/loss", loss)
             self.training_log()
         return loss
@@ -965,6 +1032,18 @@ class Boltz2(LightningModule):
                 prog_bar=False,
             )
 
+        if self.water_counts_prediction:
+            self.log(
+                "train/grad_norm_water_counts_module",
+                self.gradient_norm(self.water_counts_module),
+                prog_bar=False,
+            )
+            self.log(
+                "train/param_norm_water_counts_module",
+                self.parameter_norm(self.water_counts_module),
+                prog_bar=False,
+            )
+
     def on_train_epoch_end(self):
         if self.confidence_prediction:
             self.log(
@@ -976,6 +1055,15 @@ class Boltz2(LightningModule):
             )
             for k, v in self.train_confidence_loss_dict_logger.items():
                 self.log(f"train/{k}", v, prog_bar=False, on_step=False, on_epoch=True)
+
+        if self.water_counts_prediction:
+            self.log(
+                "train/water_counts_loss",
+                self.train_water_counts_loss_logger,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+            )
 
     def gradient_norm(self, module):
         parameters = [
@@ -1142,7 +1230,11 @@ class Boltz2(LightningModule):
                 pn
                 for pn, p in self.named_parameters()
                 if p.requires_grad
-                and ("out_token_feat_update" in pn or "confidence_module" in pn)
+                and (
+                    "out_token_feat_update" in pn
+                    or "confidence_module" in pn
+                    or "water_counts_module" in pn
+                )
             ]
 
         if self.training_args.get("weight_decay", 0.0) > 0:
